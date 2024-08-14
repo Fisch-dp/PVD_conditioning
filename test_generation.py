@@ -7,7 +7,10 @@ import torch.nn as nn
 import torch.utils.data
 
 import argparse
+import random
 from torch.distributions import Normal
+import torch.nn.functional as F
+
 
 from utils.file_utils import *
 from utils.visualize import *
@@ -16,6 +19,9 @@ from model.pvcnn_generation import PVCNN2Base
 from tqdm import tqdm
 
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+
+from transformers import BertTokenizer, BertModel
+
 
 '''
 models
@@ -184,13 +190,19 @@ class GaussianDiffusion:
 
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False, use_var=True):
+    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False, use_var=True, same_noise=False):
         """
         Sample from the model
         """
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
                                                                  return_pred_xstart=True)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
+        
+        if same_noise:
+            choice = random.randrange(noise.shape[0])
+            #print("WARNING: NOISE IS SAME FOR ALL")
+            for i in range(noise.shape[0]):
+                noise[i] = noise[choice]
         assert noise.shape == data.shape
         # no noise when t == 0
         nonzero_mask = torch.reshape(1 - (t == 0).float(), [data.shape[0]] + [1] * (len(data.shape) - 1))
@@ -204,7 +216,7 @@ class GaussianDiffusion:
 
     def p_sample_loop(self, denoise_fn, shape, device,
                       noise_fn=torch.randn, constrain_fn=lambda x, t:x,
-                      clip_denoised=True, max_timestep=None, keep_running=False):
+                      clip_denoised=True, max_timestep=None, keep_running=False, same_noise=False):
         """
         Generate samples
         keep_running: True if we run 2 x num_timesteps, False if we just run num_timesteps
@@ -217,13 +229,21 @@ class GaussianDiffusion:
 
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        if same_noise:
+            choice = random.randrange(img_t.shape[0])
+            #print("WARNING: NOISE IS SAME FOR ALL")
+            for i in range(img_t.shape[0]):
+                
+                img_t[i] = img_t[choice]
+       
+            
         for t in reversed(range(0, final_time if not keep_running else len(self.betas))):
             img_t = constrain_fn(img_t, t)
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
-                                  clip_denoised=clip_denoised, return_pred_xstart=False).detach()
+                                  clip_denoised=clip_denoised, return_pred_xstart=False, same_noise=same_noise).detach()
 
-
+        
         assert img_t.shape == shape
         return img_t
 
@@ -261,11 +281,12 @@ class PVCNN2(PVCNN2Base):
     ]
 
     def __init__(self, num_classes, embed_dim, use_att,dropout, extra_feature_channels=3, width_multiplier=1,
-                 voxel_resolution_multiplier=1):
+                 voxel_resolution_multiplier=1,text_embedding_channels=0):
         super().__init__(
             num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,
             dropout=dropout, extra_feature_channels=extra_feature_channels,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier,
+            text_embedding_channels=text_embedding_channels
         )
 
 
@@ -276,8 +297,17 @@ class Model(nn.Module):
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
 
         self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0)
+                            dropout=args.dropout, extra_feature_channels=0,text_embedding_channels=args.text_emb_dim)
+        self.args=args
+        # Initialize BERT tokenizer and model
+        self.tokenizer = None #BertTokenizer.from_pretrained('bert-base-uncased')
+        self.text_model = None # BertModel.from_pretrained('bert-base-uncased')
 
+    def init_BERT(self):
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.text_model = BertModel.from_pretrained('bert-base-uncased')
+    
+    
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
 
@@ -290,14 +320,69 @@ class Model(nn.Module):
             'prior_bpd_b': prior_bpd_b,
             'mse_bt':mse_bt
         }
+        
+    def text_to_embeddings(self, desc_texts):
+        # Get embeddings for the words
+        with torch.no_grad():
+            inputs = self.tokenizer(desc_texts, return_tensors='pt', padding=True, truncation=True)
+            outputs = self.text_model(**inputs)
+            # Take the mean of the token embeddings
+            word_embedding = outputs.last_hidden_state.mean(dim=1)
+            embedding = word_embedding#.squeeze().numpy()
+            
+        return embedding
 
 
     def _denoise(self, data, t):
-        B, D,N= data.shape
+        B, D, N = data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
+        
+        # interpolation between sport_car and minivan
+        #0. Sedan    1. SUV (Sport Utility Vehicle)   2. Coupe    3. Convertible   4. Hatchback  5. Pickup Truck  6. Minivan  7. Wagon   8. Sports Car   9. Limousine
+        
+        if self.args.text_emb_dim == 10:
+            sport_car_tensor = torch.tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 1], dtype=torch.float32)
+            minivan_tensor   = torch.tensor([0, 0, 0, 0, 0, 1, 0, 0, 0, 0], dtype=torch.float32)
 
-        out = self.model(data, t)
+            if self.args.interpolation:
+                #print("generate Interpolation of shape", B)
+                # Generate interpolated tensors
+                tensors = []
+                for i in range(B):
+                    alpha = i / (B - 1)  # Calculate interpolation factor
+                    interpolated_tensor = (1 - alpha) * sport_car_tensor + alpha * minivan_tensor
+                    tensors.append(interpolated_tensor)
+
+                # Convert the list of tensors to a PyTorch tensor (optional)
+                desc = torch.stack(tensors).unsqueeze(2).repeat(1, 1, N) # shape (B,10,2024)
+            else:
+                #print("generate different classes")
+                # otherwise have 5 items of each type
+                if B == 50:
+                    desc_int = torch.arange(10).repeat_interleave(5).cuda()
+                else:
+                    desc_int = torch.zeros(B, dtype=torch.int64).cuda()
+
+                desc = F.one_hot(desc_int, num_classes=self.args.text_emb_dim)
+                desc = desc.unsqueeze(-1).repeat(1, 1, N)  # shape (B,10,2024)
+        else:
+            # complex embeddings
+            text_guidance = [ "coupe audi a4 coupe",
+                              "sportscar porsche 911 carrera turbo",
+                              "pickuptruck tesla cybertruck future big",
+                              "sportscar ferrari testarossa",
+                              "convertible mini red british"]
+                              
+            emb = self.text_to_embeddings(text_guidance).repeat(10, 1) # make a 50x1024 tensor
+            #emb = torch.stack(emb_list)
+            emb = emb.unsqueeze(2).repeat(1, 1, N) # shape (50,10,2024)
+            desc = emb[:B].cuda() # shape(B,10,1024) 
+
+            
+        # data = torch.cat([data, desc], dim=1)
+        
+        out = self.model(data, t, desc)
 
         assert out.shape == torch.Size([B, D, N])
         return out
@@ -320,7 +405,7 @@ class Model(nn.Module):
         return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
                                             constrain_fn=constrain_fn,
                                             clip_denoised=clip_denoised, max_timestep=max_timestep,
-                                            keep_running=keep_running)
+                                            keep_running=keep_running, same_noise=self.args.interpolation)
 
     def reconstruct(self, x0, t, constrain_fn=lambda x, t:x):
 
@@ -452,26 +537,28 @@ def generate(model, opt):
         ref = []
 
         for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
+            
+            if i == 0:
+                x = data['test_points'].transpose(1,2)
+                m, s = data['mean'].float(), data['std'].float()
 
-            x = data['test_points'].transpose(1,2)
-            m, s = data['mean'].float(), data['std'].float()
+                gen = model.gen_samples(x.shape,
+                                           'cuda', clip_denoised=False).detach().cpu()
 
-            gen = model.gen_samples(x.shape,
-                                       'cuda', clip_denoised=False).detach().cpu()
-
-            gen = gen.transpose(1,2).contiguous()
-            x = x.transpose(1,2).contiguous()
+                gen = gen.transpose(1,2).contiguous()
+                x = x.transpose(1,2).contiguous()
 
 
 
-            gen = gen * s + m
-            x = x * s + m
-            samples.append(gen)
-            ref.append(x)
+                gen = gen * s + m
+                x = x * s + m
+                samples.append(gen)
+                ref.append(x)
 
-            visualize_pointcloud_batch(os.path.join(str(Path(opt.eval_path).parent), 'x.png'), gen[:64], None,
-                                       None, None)
-
+                visualize_pointcloud_batch(os.path.join(str(Path(opt.eval_path).parent), 'x.png'), gen[:64], None,
+                                           None, None)
+        print("len", len(samples))
+        print("SHAPE", samples[0].shape)
         samples = torch.cat(samples, dim=0)
         ref = torch.cat(ref, dim=0)
 
@@ -517,6 +604,7 @@ def main(opt):
 
         resumed_param = torch.load(opt.model)
         model.load_state_dict(resumed_param['model_state'])
+        model.init_BERT()
 
 
         ref = None
@@ -558,9 +646,13 @@ def parse_args():
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
+    parser.add_argument('--interpolation', default=False)
 
 
     parser.add_argument('--model', default='',required=True, help="path to model (to continue training)")
+    
+    parser.add_argument('--text_emb_dim', default=768, type=int, help='number of text_embedding dimensions')
+
 
     '''eval'''
 

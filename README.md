@@ -9,20 +9,20 @@ Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
 
 [Linqi Zhou](https://alexzhou907.github.io), [Yilun Du](https://yilundu.github.io/), [Jiajun Wu](https://jiajunwu.com/)
 
-## Requirements:
+## Modifications to Original PVD:
+* enable generation of point clouds conditioned on simple text embeddings (class) or complex embeddings (class, brand, tags, ...)
+* interpolation of different text embeddings
+* partial load unconditionally trained models to make use of pretraining
+ 
 
-Make sure the following environments are installed.
+## Installation:
 
 ```
-python==3.6
-pytorch==1.4.0
-torchvision==0.5.0
-cudatoolkit==10.1
-matplotlib==2.2.5
-tqdm==4.32.1
-open3d==0.9.0
-trimesh=3.7.12
-scipy==1.5.1
+conda create -n pvd python=3.6 cudatoolkit=11.1.* -c nvidia
+conda activate pvd
+conda install pytorch torchvision cudatoolkit=11.1 -c pytorch
+pip install kaolin==0.1.0 pytorch3d==0.2.5 xmltodict==0.12.0 numba==0.51.2 pycuda==2019.1.2 matplotlib
+pip install torch-scatter==2.0.4 torch-sparse==0.6.1 torch-cluster==1.5.4 torch-spline-conv==1.2.0 descartes==1.1.0 fire==0.3.1 jupyter==1.0.0 opencv_python==4.3.0.* Shapely==1.7.0 Pillow==6.2.1 torch_geometric==1.6.0 open3d trimesh ninja
 ```
 
 Install PyTorchEMD by
@@ -62,7 +62,7 @@ Please refer to the python file for optimal training parameters.
 ## Testing:
 
 ```bash
-$ python train_generation.py --category car|chair|airplane --model MODEL_PATH
+$ python test_generation.py --category car|chair|airplane --model MODEL_PATH
 ```
 
 ## Results

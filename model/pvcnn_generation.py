@@ -172,17 +172,34 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
 class PVCNN2Base(nn.Module):
 
     def __init__(self, num_classes, embed_dim, use_att, dropout=0.1,
-                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1):
+                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1, text_embedding_channels=0):
         super().__init__()
         assert extra_feature_channels >= 0
         self.embed_dim = embed_dim
         self.in_channels = extra_feature_channels + 3
+        #print("in_channels", self.in_channels)
+        #print("!!!!!!extra_feature_channels", extra_feature_channels)
 
+        #print("BEFORE")
+        #sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
+        #    sa_blocks=self.sa_blocks, extra_feature_channels=0, with_se=True, embed_dim=embed_dim +text_embedding_channels,
+        #    use_att=use_att, dropout=dropout,
+        #    width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+        #)
+        #print("SA_LAYERS", sa_layers)
+        #print("sa_in_channels", sa_in_channels)
+        #print("channels_sa_features",channels_sa_features)
+
+        #print("NOW")
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
-            sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
+            sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim+text_embedding_channels,
             use_att=use_att, dropout=dropout,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
+        #print("SA_LAYERS", sa_layers)
+        #print("sa_in_channels", sa_in_channels)
+        #print("channels_sa_features",channels_sa_features)
+
         self.sa_layers = nn.ModuleList(sa_layers)
 
         self.global_att = None if not use_att else Attention(channels_sa_features, 8, D=1)
@@ -190,7 +207,7 @@ class PVCNN2Base(nn.Module):
         # only use extra features in the last fp module
         sa_in_channels[0] = extra_feature_channels
         fp_layers, channels_fp_features = create_pointnet2_fp_modules(
-            fp_blocks=self.fp_blocks, in_channels=channels_sa_features, sa_in_channels=sa_in_channels, with_se=True, embed_dim=embed_dim,
+            fp_blocks=self.fp_blocks, in_channels=channels_sa_features, sa_in_channels=sa_in_channels, with_se=True, embed_dim=embed_dim+text_embedding_channels,
             use_att=use_att, dropout=dropout,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
@@ -222,25 +239,31 @@ class PVCNN2Base(nn.Module):
         assert emb.shape == torch.Size([timesteps.shape[0], self.embed_dim])
         return emb
 
-    def forward(self, inputs, t):
+    def forward(self, inputs, t, text_emb):
 
         temb =  self.embedf(self.get_timestep_embedding(t, inputs.device))[:,:,None].expand(-1,-1,inputs.shape[-1])
 
-        # inputs : [B, in_channels + S, N]
+        text_emb_dim = text_emb.shape[1]
+        
+        time_and_text_emb = torch.cat([temb, text_emb], dim=1)
+
+        # inputs : [B, in_channels + S + T, N] where T are text embeddings (e.g. shape 10)
         coords, features = inputs[:, :3, :].contiguous(), inputs
+        #print("features", features.shape)
         coords_list, in_features_list = [], []
         for i, sa_blocks  in enumerate(self.sa_layers):
             in_features_list.append(features)
             coords_list.append(coords)
             if i == 0:
-                features, coords, temb = sa_blocks ((features, coords, temb))
+                #print("i",i,"features, coords, time_and_text_emb", features.shape, coords.shape, time_and_text_emb.shape)
+                features, coords, time_and_text_emb = sa_blocks ((features, coords, time_and_text_emb))
             else:
-                features, coords, temb = sa_blocks ((torch.cat([features,temb],dim=1), coords, temb))
-        in_features_list[0] = inputs[:, 3:, :].contiguous()
+                features, coords, time_and_text_emb = sa_blocks ((torch.cat([features,time_and_text_emb],dim=1), coords, time_and_text_emb))
+        in_features_list[0] = inputs[:, 3+text_emb_dim:, :].contiguous()
         if self.global_att is not None:
             features = self.global_att(features)
         for fp_idx, fp_blocks  in enumerate(self.fp_layers):
-            features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
+            features, coords, time_and_text_emb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,time_and_text_emb],dim=1), in_features_list[-1-fp_idx], time_and_text_emb))
 
         return self.classifier(features)
 

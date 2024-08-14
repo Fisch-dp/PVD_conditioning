@@ -2,15 +2,19 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
+import torch.nn.functional as F
 
 import argparse
+import re
+
 from torch.distributions import Normal
 
 from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
-from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+#from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from datasets.objaverse_data_pc import Objaverse15kPointClouds
 
 '''
 some utils
@@ -389,11 +393,12 @@ class PVCNN2(PVCNN2Base):
     ]
 
     def __init__(self, num_classes, embed_dim, use_att,dropout, extra_feature_channels=3, width_multiplier=1,
-                 voxel_resolution_multiplier=1):
+                 voxel_resolution_multiplier=1, text_embedding_channels=0):
         super().__init__(
             num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,
             dropout=dropout, extra_feature_channels=extra_feature_channels,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier,
+            text_embedding_channels=text_embedding_channels
         )
 
 
@@ -403,13 +408,13 @@ class Model(nn.Module):
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
 
         self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0)
-
+                            dropout=args.dropout, extra_feature_channels=0, text_embedding_channels=args.text_emb_dim)
+        self.args = args
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
 
-    def all_kl(self, x0, clip_denoised=True):
-        total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(self._denoise, x0, clip_denoised)
+    def all_kl(self, x0, desc, clip_denoised=True):
+        total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(lambda data, t: self._denoise(data, t, desc), x0, clip_denoised)
 
         return {
             'total_bpd_b': total_bpd_b,
@@ -419,17 +424,21 @@ class Model(nn.Module):
         }
 
 
-    def _denoise(self, data, t):
+    def _denoise(self, data, t, desc):
         B, D,N= data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
+        assert desc.shape == torch.Size([B, self.args.text_emb_dim])
 
-        out = self.model(data, t)
+        desc = desc.unsqueeze(-1).repeat(1, 1, N)
+        # data = torch.cat([data, desc], dim=1)
+
+        out = self.model(data, t, desc)
 
         assert out.shape == torch.Size([B, D, N])
         return out
 
-    def get_loss_iter(self, data, noises=None):
+    def get_loss_iter(self, data, desc, noises=None):
         B, D, N = data.shape
         t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
 
@@ -437,21 +446,22 @@ class Model(nn.Module):
             noises[t!=0] = torch.randn((t!=0).sum(), *noises.shape[1:]).to(noises)
 
         losses = self.diffusion.p_losses(
-            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
+            denoise_fn=lambda data, t: self._denoise(data, t, desc), data_start=data, t=t, noise=noises)
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, shape, device, noise_fn=torch.randn,
+    def gen_samples(self, shape, device, desc, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
-                                            clip_denoised=clip_denoised,
-                                            keep_running=keep_running)
+        return self.diffusion.p_sample_loop(lambda data, t: self._denoise(data, t, desc), shape=shape, device=device,
+                                            noise_fn=noise_fn, clip_denoised=clip_denoised, keep_running=keep_running)
 
-    def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
+
+
+    def gen_sample_traj(self, shape, device, desc, freq, noise_fn=torch.randn,
                     clip_denoised=True,keep_running=False):
-        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
-                                                       clip_denoised=clip_denoised,
+        return self.diffusion.p_sample_loop_trajectory(lambda data, t: self._denoise(data, t, desc), shape=shape, device=device,
+                                                       noise_fn=noise_fn, freq=freq, clip_denoised=clip_denoised,
                                                        keep_running=keep_running)
 
     def train(self):
@@ -488,7 +498,7 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 
 def get_dataset(dataroot, npoints,category):
-    tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
+    tr_dataset = Objaverse15kPointClouds(root_dir=dataroot,
         categories=[category], split='train',
         tr_sample_size=npoints,
         te_sample_size=npoints,
@@ -496,7 +506,7 @@ def get_dataset(dataroot, npoints,category):
         normalize_per_shape=False,
         normalize_std_per_axis=False,
         random_subsample=True)
-    te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
+    te_dataset = Objaverse15kPointClouds(root_dir=dataroot,
         categories=[category], split='val',
         tr_sample_size=npoints,
         te_sample_size=npoints,
@@ -539,6 +549,14 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
         test_dataloader = None
 
     return train_dataloader, test_dataloader, train_sampler, test_sampler
+
+
+def check_layername(key):
+    pattern1 = re.compile(r'sa_layers\.\d+\.0\.[a-zA-Z_\.]+\.0')
+    pattern2 = re.compile(r'fp_layers\.\d+\.0\.mlp\.layers\.0')
+    pattern3 = re.compile(r'sa_layers\.3\.mlps\.0\.layers\.0')
+    
+    return bool(pattern1.search(key) or pattern2.search(key) or pattern3.search(key))
 
 
 def train(gpu, opt, output_dir, noises_init):
@@ -612,10 +630,18 @@ def train(gpu, opt, output_dir, noises_init):
 
     if opt.model != '':
         ckpt = torch.load(opt.model)
-        model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
+        model_state_dict = ckpt['model_state']
+        if opt.load_partial:
+            keys_to_remove = [key for key in model_state_dict.keys() if check_layername(key)]
+            # print("Keys to remove:",keys_to_remove)
+            for key in keys_to_remove:
+                del model_state_dict[key]
+        #print("Keys remaining:",model_state_dict.items())
+        model.load_state_dict(model_state_dict,strict=False)
+        if not opt.load_partial:
+            optimizer.load_state_dict(ckpt['optimizer_state'])
 
-    if opt.model != '':
+    if opt.model != '' and not opt.load_partial:
         start_epoch = torch.load(opt.model)['epoch'] + 1
     else:
         start_epoch = 0
@@ -634,6 +660,13 @@ def train(gpu, opt, output_dir, noises_init):
 
         for i, data in enumerate(dataloader):
             x = data['train_points'].transpose(1,2)
+            SIMPLE_EMB = False
+            if SIMPLE_EMB:
+                desc_int = data['desc']
+                desc = F.one_hot(desc_int, num_classes=opt.text_emb_dim)
+            else:
+                desc = data['desc']
+
             noises_batch = noises_init[data['idx']].transpose(1,2)
 
             '''
@@ -642,12 +675,14 @@ def train(gpu, opt, output_dir, noises_init):
 
             if opt.distribution_type == 'multi' or (opt.distribution_type is None and gpu is not None):
                 x = x.cuda(gpu)
+                desc = desc.cuda()
                 noises_batch = noises_batch.cuda(gpu)
             elif opt.distribution_type == 'single':
                 x = x.cuda()
+                desc = desc.cuda()
                 noises_batch = noises_batch.cuda()
 
-            loss = model.get_loss_iter(x, noises_batch).mean()
+            loss = model.get_loss_iter(x, desc, noises_batch).mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -673,7 +708,10 @@ def train(gpu, opt, output_dir, noises_init):
             logger.info('Diagnosis:')
 
             x_range = [x.min().item(), x.max().item()]
-            kl_stats = model.all_kl(x)
+            # Use SUV class as test
+            desc = torch.zeros([opt.bs,opt.text_emb_dim]).cuda()
+            desc[:,1] = 1
+            kl_stats = model.all_kl(x, desc)
             logger.info('      [{:>3d}/{:>3d}]    '
                          'x_range: [{:>10.4f}, {:>10.4f}],   '
                          'total_bpd_b: {:>10.4f},    '
@@ -694,9 +732,19 @@ def train(gpu, opt, output_dir, noises_init):
 
             model.eval()
             with torch.no_grad():
+                
+                
+                # Use SUV class as test
+                desc_25 = torch.zeros([25,opt.text_emb_dim]).cuda()
+                desc_25[:,1] = 1
+                desc_1 = torch.zeros([1,opt.text_emb_dim]).cuda()
+                desc_1[:,1] = 1
+                #print("DESC",desc.shape)
+                #print("x", x.shape)
+                #print("chain", new_x_chain(x,25).shape)
 
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=40, clip_denoised=False)
+                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, desc_25, clip_denoised=False)
+                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, desc_1, freq=40, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
@@ -786,7 +834,7 @@ def main():
 def parse_args():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
+    parser.add_argument('--dataroot', default='ObjaversePC15k/')
     parser.add_argument('--category', default='chair')
 
     parser.add_argument('--bs', type=int, default=16, help='input batch size')
@@ -816,7 +864,7 @@ def parse_args():
     parser.add_argument('--lr_gamma', type=float, default=0.998, help='lr decay for EBM')
 
     parser.add_argument('--model', default='', help="path to model (to continue training)")
-
+    parser.add_argument('--load_partial', action='store_true', help="Load the model partially, excluding certain layers")
 
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
@@ -836,13 +884,14 @@ def parse_args():
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=100, help='unit: epoch')
+    parser.add_argument('--saveIter', default=50, help='unit: epoch')
     parser.add_argument('--diagIter', default=50, help='unit: epoch')
     parser.add_argument('--vizIter', default=50, help='unit: epoch')
     parser.add_argument('--print_freq', default=50, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
-
+    
+    parser.add_argument('--text_emb_dim', default=768, type=int, help='number of text_embedding dimensions')
 
     opt = parser.parse_args()
 

@@ -8,6 +8,7 @@ import open3d as o3d
 import numpy as np
 import torch.nn.functional as F
 import pandas as pd
+from transformers import BertTokenizer, BertModel
 
 
 
@@ -63,6 +64,11 @@ class Uniform15KPC(Dataset):
         self.cate_idx_lst = []
         self.all_points = []
         self.all_descriptions = []
+        
+        # Initialize BERT tokenizer and model
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.text_model = BertModel.from_pretrained('bert-base-uncased')
+        
         for cate_idx, subd in enumerate(self.subdirs):
             # NOTE: [subd] here is synset id
             sub_path = os.path.join(root_dir, subd, self.split)
@@ -70,8 +76,8 @@ class Uniform15KPC(Dataset):
                 print("Directory missing : %s" % sub_path)
                 continue
 
-            description_path = os.path.join(root_dir, subd, self.split, "predictions.txt")
-            df = pd.read_csv(description_path, header=None, index_col=0, names=['Path', 'Category'])
+            description_path = os.path.join(root_dir, subd, "predictions_refined.txt")
+            df = pd.read_csv(description_path, header=None, index_col=0, names=['Path','UID', 'Category', 'Brand', 'Tag1', 'Tag2', 'Tag3'])
             all_mids = []
             for x in os.listdir(sub_path):
                 if not x.endswith('.npy'):
@@ -83,7 +89,8 @@ class Uniform15KPC(Dataset):
                 # obj_fname = os.path.join(sub_path, x)
                 obj_fname = os.path.join(root_dir, subd, mid + ".npy")
                 _, mid_without_split = mid.split("/")
-                description = int(df.loc[mid_without_split])
+                description_list = df.loc[mid_without_split].tolist()[1:]
+                description_emb = self.text_to_embeddings(description_list)
                 try:
                     point_cloud = np.load(obj_fname)  # (15k, 3)
 
@@ -94,7 +101,7 @@ class Uniform15KPC(Dataset):
                 self.all_points.append(point_cloud[np.newaxis, ...])
                 self.cate_idx_lst.append(cate_idx)
                 self.all_cate_mids.append((subd, mid))
-                self.all_descriptions.append(description)
+                self.all_descriptions.append(description_emb)
 
         # Shuffle the index deterministically (based on the number of examples)
         self.shuffle_idx = list(range(len(self.all_points)))
@@ -143,6 +150,8 @@ class Uniform15KPC(Dataset):
         print("Min number of points: (train)%d (test)%d"
               % (self.tr_sample_size, self.te_sample_size))
         assert self.scale == 1, "Scale (!= 1) is deprecated"
+        
+
 
     def get_pc_stats(self, idx):
         if self.normalize_per_shape or self.box_per_shape:
@@ -152,6 +161,19 @@ class Uniform15KPC(Dataset):
 
 
         return self.all_points_mean.reshape(1, -1), self.all_points_std.reshape(1, -1)
+
+    
+    def text_to_embeddings(self, word_list):
+        desc_text = " ".join(word_list)
+        # Get embeddings for the words
+        with torch.no_grad():
+            inputs = self.tokenizer(desc_text, return_tensors='pt')
+            outputs = self.text_model(**inputs)
+            # Take the mean of the token embeddings
+            word_embedding = outputs.last_hidden_state.mean(dim=1)
+            embedding = word_embedding.squeeze().numpy()
+        
+        return embedding
 
 
 
@@ -212,9 +234,9 @@ class Uniform15KPC(Dataset):
         return out
 
 
-class ShapeNet15kPointClouds(Uniform15KPC):
-    def __init__(self, root_dir="data/ShapeNetCore.v2.PC15k",
-                 categories=['airplane'], tr_sample_size=10000, te_sample_size=2048,
+class Objaverse15kPointClouds(Uniform15KPC):
+    def __init__(self, root_dir="data/ObjaversePC15k",
+                 categories=['car'], tr_sample_size=10000, te_sample_size=2048,
                  split='train', scale=1., normalize_per_shape=False,
                  normalize_std_per_axis=False, box_per_shape=False,
                  random_subsample=False,
@@ -235,7 +257,7 @@ class ShapeNet15kPointClouds(Uniform15KPC):
         self.gravity_axis = 1
         self.display_axis_order = [0, 2, 1]
 
-        super(ShapeNet15kPointClouds, self).__init__(
+        super(Objaverse15kPointClouds, self).__init__(
             root_dir, self.synset_ids,
             tr_sample_size=tr_sample_size,
             te_sample_size=te_sample_size,
