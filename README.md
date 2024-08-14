@@ -10,9 +10,17 @@ Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
 [Linqi Zhou](https://alexzhou907.github.io), [Yilun Du](https://yilundu.github.io/), [Jiajun Wu](https://jiajunwu.com/)
 
 ## Modifications to Original PVD:
-* enable generation of point clouds conditioned on simple text embeddings (class) or complex embeddings (class, brand, tags, ...)
-* interpolation of different text embeddings
-* partial load unconditionally trained models to make use of pretraining
+<p align="left">
+  <img src="assets/Interpolation_limousine_to_wagon.gif" width="45%"/>
+  <img src="assets/Interpolation_sports_car_to_minivan.gif" width="45%"/>
+</p>
+<p align="right">
+  
+</p> 
+
+1. Enabled the generation of point clouds conditioned on simple text embeddings (class) or complex embeddings (class, brand, tags, ...)
+2. Made Interpolation of different text embeddings possible
+3. Added partial load of unconditionally trained models to make use of pretraining. Save around 80% of training time
  
 
 ## Installation:
