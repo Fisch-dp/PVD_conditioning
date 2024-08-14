@@ -1,4 +1,5 @@
 import os
+import warnings
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -7,6 +8,11 @@ import random
 import open3d as o3d
 import numpy as np
 import torch.nn.functional as F
+import glob
+from PIL import Image
+from torchvision import transforms
+import cv2
+import fill_voids
 
 # taken from https://github.com/optas/latent_3d_points/blob/8e8f29f8124ed5fc59439e8551ba7ef7567c9a37/src/in_out.py
 synsetid_to_cate = {
@@ -42,7 +48,7 @@ class Uniform15KPC(Dataset):
                  random_subsample=False,
                  normalize_std_per_axis=False,
                  all_points_mean=None, all_points_std=None,
-                 input_dim=3, use_mask=False):
+                 input_dim=3, use_mask=False, size=256):
         self.root_dir = root_dir
         self.split = split
         self.in_tr_sample_size = tr_sample_size
@@ -53,12 +59,22 @@ class Uniform15KPC(Dataset):
         self.input_dim = input_dim
         self.use_mask = use_mask
         self.box_per_shape = box_per_shape
+        # Image variables
+        self.size = size
+        self.transform =  transforms.Compose(
+            [transforms.ToTensor(),
+             transforms.Resize((size, size)), 
+             ])
+        self.normalize = transforms.Normalize(mean=[0.5,0.5,0.5], 
+                                  std=[0.5,0.5,0.5])
+
         if use_mask:
             self.mask_transform = PointCloudMasks(radius=5, elev=5, azim=90)
-
+            
         self.all_cate_mids = []
         self.cate_idx_lst = []
         self.all_points = []
+        self.all_img_paths = []
         for cate_idx, subd in enumerate(self.subdirs):
             # NOTE: [subd] here is synset id
             sub_path = os.path.join(root_dir, subd, self.split)
@@ -67,10 +83,21 @@ class Uniform15KPC(Dataset):
                 continue
 
             all_mids = []
-            for x in os.listdir(sub_path):
-                if not x.endswith('.npy'):
-                    continue
-                all_mids.append(os.path.join(self.split, x[:-len('.npy')]))
+            for i, x in enumerate(os.listdir(sub_path)):
+                try: 
+                    if not x.endswith('.npy'):
+                        continue
+                    mid = os.path.join(self.split, x[:-len('.npy')])
+                    imgs = glob.glob(f"/cluster/51/go25dap/PVD/ShapeNetCore.v2/{subd}/{x[:-len('.npy')]}/screenshots/*")
+                    if len(imgs) < 6:
+                        raise ValueError(f"Error in {x}: only have {len(imgs)} images, but 6 are required")
+                    paths = [f"/cluster/51/go25dap/PVD/ShapeNetCore.v2/{subd}/{x[:-len('.npy')]}/screenshots/{x[:-len('.npy')]}-{i}.png" for i in range(6)]
+                    self.all_img_paths.append(paths)
+                    all_mids.append(mid)
+                except Exception as e:
+                    pass
+                    #warnings.warn(str(e))
+            
 
             # NOTE: [mid] contains the split: i.e. "train/<mid>" or "val/<mid>" or "test/<mid>"
             for mid in all_mids:
@@ -93,6 +120,7 @@ class Uniform15KPC(Dataset):
         self.cate_idx_lst = [self.cate_idx_lst[i] for i in self.shuffle_idx]
         self.all_points = [self.all_points[i] for i in self.shuffle_idx]
         self.all_cate_mids = [self.all_cate_mids[i] for i in self.shuffle_idx]
+        self.all_img_paths = [self.all_img_paths[i] for i in self.shuffle_idx]
 
         # Normalization
         self.all_points = np.concatenate(self.all_points)  # (N, 15000, 3)
@@ -156,6 +184,7 @@ class Uniform15KPC(Dataset):
 
     def __getitem__(self, idx):
         tr_out = self.train_points[idx]
+        img_paths = self.all_img_paths[idx]
         if self.random_subsample:
             tr_idxs = np.random.choice(tr_out.shape[0], self.tr_sample_size)
         else:
@@ -172,13 +201,26 @@ class Uniform15KPC(Dataset):
         m, s = self.get_pc_stats(idx)
         cate_idx = self.cate_idx_lst[idx]
         sid, mid = self.all_cate_mids[idx]
+        images = []
+        for img_path in img_paths:
+            image = np.array(Image.open(img_path))
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB) / 255
+            #image = np.where(image < np.max(image), image, 0)
+            images.append(self.normalize(self.transform(image)).unsqueeze(0))
+        images = torch.cat(images, dim=0)
+        
+
 
         out = {
             'idx': idx,
             'train_points': tr_out,
             'test_points': te_out,
             'mean': m, 'std': s, 'cate_idx': cate_idx,
-            'sid': sid, 'mid': mid
+            'sid': sid, 'mid': mid,
+            'img': images,
+            'img_path': img_path,
+            'sidmid':(sid, mid),
+            
         }
 
         if self.use_mask:
@@ -199,7 +241,7 @@ class Uniform15KPC(Dataset):
 
 
 class ShapeNet15kPointClouds(Uniform15KPC):
-    def __init__(self, root_dir="data/ShapeNetCore.v2.PC15k",
+    def __init__(self, root_dir="/cluster/51/go25dap/PVD/ShapeNetCore.v2.PC15k",
                  categories=['airplane'], tr_sample_size=10000, te_sample_size=2048,
                  split='train', scale=1., normalize_per_shape=False,
                  normalize_std_per_axis=False, box_per_shape=False,

@@ -1,10 +1,10 @@
 import functools
-
 import torch.nn as nn
 import torch
 import numpy as np
 from modules import SharedMLP, PVConv, PointNetSAModule, PointNetAModule, PointNetFPModule, Attention, Swish
-
+from modules.pvconv import PVConv_CA
+from copy import deepcopy
 
 def _linear_gn_relu(in_channels, out_channels):
     return nn.Sequential(nn.Linear(in_channels, out_channels), nn.GroupNorm(8,out_channels), Swish())
@@ -69,7 +69,7 @@ def create_pointnet_components(blocks, in_channels, embed_dim, with_se=False, no
     return layers, in_channels, concat_channels
 
 
-def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=64, use_att=False,
+def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=64, use_att=False, use_ca=False,
                                    dropout=0.1, with_se=False, normalize=True, eps=0,
                                    width_multiplier=1, voxel_resolution_multiplier=1):
     r, vr = width_multiplier, voxel_resolution_multiplier
@@ -77,7 +77,7 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
 
     sa_layers, sa_in_channels = [], []
     c = 0
-    for conv_configs, sa_configs in sa_blocks:
+    for idx, (conv_configs, sa_configs) in enumerate(sa_blocks):
         k = 0
         sa_in_channels.append(in_channels)
         sa_blocks = []
@@ -87,15 +87,22 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
             out_channels = int(r * out_channels)
             for p in range(num_blocks):
                 attention = (c+1) % 2 == 0 and use_att and p == 0
+                ca_attention = (c+1) % 3 == 0 and p == 0 and use_ca and False
                 if voxel_resolution is None:
                     block = SharedMLP
                 else:
-                    block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
+                    if ca_attention:
+                        block = functools.partial(PVConv_CA, kernel_size=3, resolution=int(vr * voxel_resolution), attention=ca_attention,
+                                                dropout=dropout,
+                                                with_se=with_se, with_se_relu=True,
+                                                normalize=normalize, eps=eps)
+                    else:
+                        block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
                                               dropout=dropout,
                                               with_se=with_se, with_se_relu=True,
                                               normalize=normalize, eps=eps)
 
-                if c == 0:
+                if c == 0 or ca_attention:
                     sa_blocks.append(block(in_channels, out_channels))
                 elif k ==0:
                     sa_blocks.append(block(in_channels+embed_dim, out_channels))
@@ -127,7 +134,7 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
     return sa_layers, sa_in_channels, in_channels, 1 if num_centers is None else num_centers
 
 
-def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_dim=64, use_att=False,
+def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_dim=64, use_att=False, use_ca=False,
                                 dropout=0.1,
                                 with_se=False, normalize=True, eps=0,
                                 width_multiplier=1, voxel_resolution_multiplier=1):
@@ -148,13 +155,20 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
             out_channels = int(r * out_channels)
             for p in range(num_blocks):
                 attention = (c+1) % 2 == 0 and c < len(fp_blocks) - 1 and use_att and p == 0
+                ca_attention = (c+1) % 3 == 0 and c < len(fp_blocks) - 1 and p == 0 and use_ca and False
                 if voxel_resolution is None:
                     block = SharedMLP
                 else:
-                    block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
+                    if ca_attention:
+                        block = functools.partial(PVConv_CA, kernel_size=3, resolution=int(vr * voxel_resolution), attention=ca_attention,
                                               dropout=dropout,
                                               with_se=with_se, with_se_relu=True,
                                               normalize=normalize, eps=eps)
+                    else:
+                        block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
+                                                dropout=dropout,
+                                                with_se=with_se, with_se_relu=True,
+                                                normalize=normalize, eps=eps)
 
                 fp_blocks.append(block(in_channels, out_channels))
                 in_channels = out_channels
@@ -167,11 +181,9 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
 
     return fp_layers, in_channels
 
-
-
 class PVCNN2Base(nn.Module):
 
-    def __init__(self, num_classes, embed_dim, use_att, dropout=0.1,
+    def __init__(self, num_classes, embed_dim, use_att, use_ca, dropout=0.1,
                  extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1):
         super().__init__()
         assert extra_feature_channels >= 0
@@ -180,7 +192,7 @@ class PVCNN2Base(nn.Module):
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
             sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
-            use_att=use_att, dropout=dropout,
+            use_att=use_att,use_ca=use_ca, dropout=dropout,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
         self.sa_layers = nn.ModuleList(sa_layers)
@@ -191,7 +203,7 @@ class PVCNN2Base(nn.Module):
         sa_in_channels[0] = extra_feature_channels
         fp_layers, channels_fp_features = create_pointnet2_fp_modules(
             fp_blocks=self.fp_blocks, in_channels=channels_sa_features, sa_in_channels=sa_in_channels, with_se=True, embed_dim=embed_dim,
-            use_att=use_att, dropout=dropout,
+            use_att=use_att,use_ca=use_ca, dropout=dropout,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
         self.fp_layers = nn.ModuleList(fp_layers)
@@ -222,26 +234,46 @@ class PVCNN2Base(nn.Module):
         assert emb.shape == torch.Size([timesteps.shape[0], self.embed_dim])
         return emb
 
-    def forward(self, inputs, t):
+    def forward(self, inputs, t, img):
 
         temb =  self.embedf(self.get_timestep_embedding(t, inputs.device))[:,:,None].expand(-1,-1,inputs.shape[-1])
+        temb_d =  self.embedf(self.get_timestep_embedding(t, inputs.device))[:,:,None].expand(-1,-1,inputs.shape[-1])
 
         # inputs : [B, in_channels + S, N]
         coords, features = inputs[:, :3, :].contiguous(), inputs
+        features_d = self.img_encoder_f(img).view(features.shape) + features
+        coords_d = self.img_encoder_c(img).view(coords.shape) + coords
         coords_list, in_features_list = [], []
-        for i, sa_blocks  in enumerate(self.sa_layers):
+        coords_list_d, in_features_list_d = [], []
+        
+        for i, (sa_blocks,sa_blocks_d)  in enumerate(zip(self.sa_layers, self.sa_layers_d)):
             in_features_list.append(features)
             coords_list.append(coords)
+
             if i == 0:
                 features, coords, temb = sa_blocks ((features, coords, temb))
+                features_d, coords_d, temb_d = sa_blocks_d ((features_d, coords_d, temb_d))
             else:
                 features, coords, temb = sa_blocks ((torch.cat([features,temb],dim=1), coords, temb))
+                features_d, coords_d, temb_d = sa_blocks_d ((torch.cat([features_d,temb_d],dim=1), coords_d, temb_d))
+            in_features_list_d.append(self.zero_convs_f[i](features_d))
+            coords_list_d.append(self.zero_convs_c[i](coords_d))            
+        
         in_features_list[0] = inputs[:, 3:, :].contiguous()
         if self.global_att is not None:
-            features = self.global_att(features)
-        for fp_idx, fp_blocks  in enumerate(self.fp_layers):
-            features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
+            features_d = self.global_att_d(features_d)
+            features_d = self.global_zero(features_d)
+            features_d = self.global_ca(torch.cat([features, features_d], dim=1))
+            #features_d = self.global_mlp(features_d.transpose(2,1)).transpose(2,1)
+            features_d = features_d[:,features.shape[1]:,:]
+            features = self.global_att(features + features_d)
+            latent = features
 
-        return self.classifier(features)
+        for fp_idx, fp_blocks in enumerate(self.fp_layers):
+            features = features + self.ca_f[-1-fp_idx](torch.cat([features, in_features_list_d[-1-fp_idx]], dim=1))[:features.shape[1],:,:]
+            coords = coords + self.ca_c[-1-fp_idx](torch.cat([coords, coords_list_d[-1-fp_idx]], dim=1))[:,coords.shape[1]:,:]
+            features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
+                
+        return self.classifier(features), latent
 
 

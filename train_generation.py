@@ -11,7 +11,36 @@ from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from modules import SharedMLP, PVConv
+from modules.pvconv import CrossAttention, Attention
 
+from ldm.util import instantiate_from_config
+from ldm.modules.ema import LitEma
+from omegaconf import OmegaConf
+
+import torch
+import torch.nn.functional as F
+from torch.autograd import Variable
+from math import exp
+from torchvision.utils import save_image
+from copy import deepcopy
+import torchvision
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+def scale_module(module, scale):
+    """
+    Scale the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().mul_(scale)
+    return module
+    
 '''
 some utils
 '''
@@ -48,7 +77,10 @@ def norm(v, f):
 
 def getGradNorm(net):
     pNorm = torch.sqrt(sum(torch.sum(p ** 2) for p in net.parameters()))
-    gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2) for p in net.parameters()))
+    for name,p in net.named_parameters():
+         if p.grad is None and p.requires_grad:
+             print(name)
+    gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2) for p in net.parameters() if p.requires_grad))
     return pNorm, gradNorm
 
 
@@ -134,6 +166,7 @@ class GaussianDiffusion:
         self.posterior_log_variance_clipped = torch.log(torch.max(posterior_variance, 1e-20 * torch.ones_like(posterior_variance)))
         self.posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.posterior_mean_coef2 = (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod)
+        self.noise_modifier = (None, None, None)
 
     @staticmethod
     def _extract(a, t, x_shape):
@@ -143,6 +176,8 @@ class GaussianDiffusion:
         """
         bs, = t.shape
         assert x_shape[0] == bs
+        a = a.cuda('cuda:0')
+        t = t.cuda('cuda:0')
         out = torch.gather(a, 0, t)
         assert out.shape == torch.Size([bs])
         return torch.reshape(out, [bs] + ((len(x_shape) - 1) * [1]))
@@ -155,17 +190,17 @@ class GaussianDiffusion:
         log_variance = self._extract(self.log_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape)
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, t, img, noise=None):
         """
         Diffuse the data (t == 0 means diffused for 1 step)
         """
         if noise is None:
-            noise = torch.randn(x_start.shape, device=x_start.device)
+            noise = torch.randn(x_start.shape, device=img.device)
+            x_start = x_start.to(img.device)
         assert noise.shape == x_start.shape
         return (
                 self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start +
-                self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise
-        )
+                self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise)
 
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
@@ -174,8 +209,8 @@ class GaussianDiffusion:
         """
         assert x_start.shape == x_t.shape
         posterior_mean = (
-                self._extract(self.posterior_mean_coef1.to(x_start.device), t, x_t.shape) * x_start +
-                self._extract(self.posterior_mean_coef2.to(x_start.device), t, x_t.shape) * x_t
+                self._extract(self.posterior_mean_coef1.to("cuda"), t, x_t.shape) * x_start.cuda('cuda:0') +
+                self._extract(self.posterior_mean_coef2.to("cuda"), t, x_t.shape) * x_t.cuda('cuda:0')
         )
         posterior_variance = self._extract(self.posterior_variance.to(x_start.device), t, x_t.shape)
         posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped.to(x_start.device), t, x_t.shape)
@@ -184,9 +219,9 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
 
-    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
+    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool, img):
 
-        model_output = denoise_fn(data, t)
+        model_output = denoise_fn(data, t, img)
 
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
@@ -229,13 +264,14 @@ class GaussianDiffusion:
 
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False):
+    def p_sample(self, denoise_fn, data, t, noise_fn, img, clip_denoised=False, return_pred_xstart=False):
         """
         Sample from the model
         """
-        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
-                                                                 return_pred_xstart=True)
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised, return_pred_xstart=True, img=img)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
+        #noise = noise + self.noise_modifier[0](noise, img)
+        #noise = self.noise_modifier[1](noise)
         assert noise.shape == data.shape
         # no noise when t == 0
         nonzero_mask = torch.reshape(1 - (t == 0).float(), [data.shape[0]] + [1] * (len(data.shape) - 1))
@@ -245,7 +281,7 @@ class GaussianDiffusion:
         return (sample, pred_xstart) if return_pred_xstart else sample
 
 
-    def p_sample_loop(self, denoise_fn, shape, device,
+    def p_sample_loop(self, denoise_fn, shape, device, img,
                       noise_fn=torch.randn, clip_denoised=True, keep_running=False):
         """
         Generate samples
@@ -255,15 +291,17 @@ class GaussianDiffusion:
 
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        #img_t = img_t + self.noise_modifier[0](img_t, img)
+        #img_t = self.noise_modifier[1](img_t)
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn, img=img,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
 
         assert img_t.shape == shape
         return img_t
 
-    def p_sample_loop_trajectory(self, denoise_fn, shape, device, freq,
+    def p_sample_loop_trajectory(self, denoise_fn, shape, device, freq, img,
                                  noise_fn=torch.randn,clip_denoised=True, keep_running=False):
         """
         Generate samples, returning intermediate images
@@ -277,11 +315,13 @@ class GaussianDiffusion:
         total_steps =  self.num_timesteps if not keep_running else len(self.betas)
 
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        #img_t = img_t + self.noise_modifier[0](img_t, img)
+        #img_t = self.noise_modifier[1](img_t)
         imgs = [img_t]
         for t in reversed(range(0,total_steps)):
 
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn, img=img,
                                   clip_denoised=clip_denoised,
                                   return_pred_xstart=False)
             if t % freq == 0 or t == total_steps-1:
@@ -292,16 +332,16 @@ class GaussianDiffusion:
 
     '''losses'''
 
-    def _vb_terms_bpd(self, denoise_fn, data_start, data_t, t, clip_denoised: bool, return_pred_xstart: bool):
+    def _vb_terms_bpd(self, denoise_fn, data_start, data_t, t, clip_denoised: bool, return_pred_xstart: bool, img):
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(x_start=data_start, x_t=data_t, t=t)
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
-            denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_pred_xstart=True)
+            denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_pred_xstart=True, img=img)
         kl = normal_kl(true_mean, true_log_variance_clipped, model_mean, model_log_variance)
         kl = kl.mean(dim=list(range(1, len(data_start.shape)))) / np.log(2.)
 
         return (kl, pred_xstart) if return_pred_xstart else kl
 
-    def p_losses(self, denoise_fn, data_start, t, noise=None):
+    def p_losses(self, denoise_fn, data_start, t, img, noise=None):
         """
         Training loss calculation
         """
@@ -312,11 +352,12 @@ class GaussianDiffusion:
             noise = torch.randn(data_start.shape, dtype=data_start.dtype, device=data_start.device)
         assert noise.shape == data_start.shape and noise.dtype == data_start.dtype
 
-        data_t = self.q_sample(x_start=data_start, t=t, noise=noise)
+        data_t = self.q_sample(x_start=data_start, t=t, img=img, noise=noise)
 
         if self.loss_type == 'mse':
             # predict the noise instead of x_start. seems to be weighted naturally like SNR
-            eps_recon = denoise_fn(data_t, t)
+            eps_recon, latent, img = denoise_fn(data_t, t, img, True)
+            directional_loss = 1 - torch.nn.functional.cosine_similarity(latent.view(latent.shape[0],1, -1), img.view(latent.shape[0],3, -1), dim=-1)
             assert data_t.shape == data_start.shape
             assert eps_recon.shape == torch.Size([B, D, N])
             assert eps_recon.shape == data_start.shape
@@ -324,12 +365,12 @@ class GaussianDiffusion:
         elif self.loss_type == 'kl':
             losses = self._vb_terms_bpd(
                 denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t, clip_denoised=False,
-                return_pred_xstart=False)
+                return_pred_xstart=False, img=img)
         else:
             raise NotImplementedError(self.loss_type)
 
         assert losses.shape == torch.Size([B])
-        return losses
+        return losses, directional_loss
 
     '''debug'''
 
@@ -344,10 +385,11 @@ class GaussianDiffusion:
             assert kl_prior.shape == x_start.shape
             return kl_prior.mean(dim=list(range(1, len(kl_prior.shape)))) / np.log(2.)
 
-    def calc_bpd_loop(self, denoise_fn, x_start, clip_denoised=True):
+    def calc_bpd_loop(self, denoise_fn, x_start, img, clip_denoised=True):
 
         with torch.no_grad():
             B, T = x_start.shape[0], self.num_timesteps
+            x_start = x_start.cuda('cuda:0')
 
             vals_bt_, mse_bt_= torch.zeros([B, T], device=x_start.device), torch.zeros([B, T], device=x_start.device)
             for t in reversed(range(T)):
@@ -355,8 +397,8 @@ class GaussianDiffusion:
                 t_b = torch.empty(B, dtype=torch.int64, device=x_start.device).fill_(t)
                 # Calculate VLB term at the current timestep
                 new_vals_b, pred_xstart = self._vb_terms_bpd(
-                    denoise_fn, data_start=x_start, data_t=self.q_sample(x_start=x_start, t=t_b), t=t_b,
-                    clip_denoised=clip_denoised, return_pred_xstart=True)
+                    denoise_fn, data_start=x_start, data_t=self.q_sample(x_start=x_start, img=img, t=t_b), t=t_b,
+                    clip_denoised=clip_denoised, return_pred_xstart=True, img=img)
                 # MSE for progressive prediction loss
                 assert pred_xstart.shape == x_start.shape
                 new_mse_b = ((pred_xstart-x_start)**2).mean(dim=list(range(1, len(x_start.shape))))
@@ -376,40 +418,144 @@ class GaussianDiffusion:
 
 class PVCNN2(PVCNN2Base):
     sa_blocks = [
+        # conv_configs, sa_configs
+        # (out_channels, num_blocks, voxel_resolution), (num_centers, radius, num_neighbors, out_channels)
+        # ()
         ((32, 2, 32), (1024, 0.1, 32, (32, 64))),
         ((64, 3, 16), (256, 0.2, 32, (64, 128))),
         ((128, 3, 8), (64, 0.4, 32, (128, 256))),
         (None, (16, 0.8, 32, (256, 256, 512))),
     ]
     fp_blocks = [
+        # fp_configs, conv_configs
+        # (,), (out_channels, num_blocks, voxel_resolution)
         ((256, 256), (256, 3, 8)),
         ((256, 256), (256, 3, 8)),
         ((256, 128), (128, 2, 16)),
         ((128, 128, 64), (64, 2, 32)),
     ]
 
-    def __init__(self, num_classes, embed_dim, use_att,dropout, extra_feature_channels=3, width_multiplier=1,
+    def __init__(self, num_classes, embed_dim, use_att,use_ca,dropout, extra_feature_channels=3, width_multiplier=1,
                  voxel_resolution_multiplier=1):
         super().__init__(
-            num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,
+            num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,use_ca=use_ca,
             dropout=dropout, extra_feature_channels=extra_feature_channels,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
 
+class PVCNN2_CA(PVCNN2Base):
+    sa_blocks =  [
+        # conv_configs, sa_configs
+        # (out_channels, num_blocks, voxel_resolution), (num_centers, radius, num_neighbors, out_channels)
+        # ()
+        ((32, 2, 32), (1024, 0.1, 32, (32, 64))),
+        ((64, 3, 16), (256, 0.2, 32, (64, 128))),
+        ((64, 3, 16), (256, 0.2, 32, (64, 128))),
+        (None, (16, 0.8, 32, (256, 256, 512))),
+    ]
+    fp_blocks = [
+        # fp_configs, conv_configs
+        # (,), (out_channels, num_blocks, voxel_resolution)
+        ((256, 256), (256, 3, 8)),
+        ((256, 256), (256, 3, 8)),
+        ((256, 128), (128, 2, 16)),
+        ((128, 128, 64), (64, 2, 32)),
+    ]
+    def __init__(self, num_classes, embed_dim, use_att,use_ca, dropout, extra_feature_channels=3, width_multiplier=1,
+                 voxel_resolution_multiplier=1):
+        super().__init__(
+            num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,use_ca=use_ca,
+            dropout=dropout, extra_feature_channels=extra_feature_channels,
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+        )
+class DirectionLoss(torch.nn.Module):
+
+    def __init__(self, loss_type='mse'):
+        super(DirectionLoss, self).__init__()
+
+        self.loss_type = loss_type
+
+        self.loss_func = {
+            'mse':    torch.nn.MSELoss,
+            'cosine': torch.nn.CosineSimilarity,
+            'mae':    torch.nn.L1Loss
+        }[loss_type]()
+
+    def forward(self, x, y):
+        if self.loss_type == "cosine":
+            return 1. - self.loss_func(x, y)
+        
+        return self.loss_func(x, y)
 
 class Model(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
         super(Model, self).__init__()
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
-
-        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
+        
+        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention, use_ca=False,
                             dropout=args.dropout, extra_feature_channels=0)
+        self.args = args
 
+    def build(self,state_dict=""): 
+        if not state_dict == "":
+            new_dict = {}
+            for key, value in state_dict.items():
+            	key = key[len("model.module"):]
+            	key = "model" + key
+            	new_dict[key] = value
+            self.load_state_dict(new_dict)
+        self.model.cuda('cuda:0')
+        sa_layers_d = deepcopy(self.model.sa_layers).cuda('cuda:0').requires_grad_(True)
+        global_att_d = deepcopy(self.model.global_att).cuda('cuda:0').requires_grad_(True)
+        self.image_encoder = nn.Sequential(
+            nn.Conv2d(3,16,3,padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16,16,3,padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16,32,3,padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(32,32,3,padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32,64,3,padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(64,64,3,padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64,128,3,padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(128,128,3,padding=1),
+            nn.SiLU(),
+            nn.Conv2d(128,256,3,padding=1, stride=2),
+            nn.SiLU(),
+            zero_module(nn.Conv2d(256, 16, 3, padding=1))
+        ).cuda('cuda:0').requires_grad_(True)
+        for p in self.model.parameters():
+                p.requires_grad_(False)
+        
+        self.model.img_encoder_f = nn.Conv2d(96, 24, 1).cuda('cuda:0').requires_grad_(True)
+        self.model.img_encoder_c = nn.Conv2d(96, 24, 1).cuda('cuda:0').requires_grad_(True)
+        self.model.sa_layers_d = sa_layers_d
+        self.model.zero_convs_f = []
+        self.model.zero_convs_c = []
+        self.model.ca_f = []
+        self.model.ca_c = []
+        self.model.mlp_f = []
+        self.model.mlp_c = []
+        for i,(dim_in, dim_out, ca_dim) in enumerate(zip([64,128,256,512],[128,256,256,512], [1024,256,64,16])):
+            self.model.zero_convs_f.append(zero_module(nn.Conv1d(dim_in, dim_out, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+            self.model.zero_convs_c.append(zero_module(nn.Conv1d(3, 3, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+            self.model.ca_f.append(Attention(dim_out*2, 8, 1).cuda('cuda:0').requires_grad_(True))
+            self.model.ca_c.append(Attention(3*2, 1, 1).cuda('cuda:0').requires_grad_(True))
+            #self.model.mlp_f.append(nn.Linear(dim_out*2, dim_out).cuda('cuda:0').requires_grad_(True))
+            #self.model.mlp_c.append(nn.Linear(3*2,3).cuda('cuda:0').requires_grad_(True))
+        self.model.global_att_d = global_att_d
+        self.model.global_zero = zero_module(nn.Conv1d(512, 512, 3, padding=1)).cuda('cuda:0').requires_grad_(True)
+        self.model.global_ca = Attention(512*2, 8, 1).cuda('cuda:0').requires_grad_(True)
+        #self.model.global_mlp = nn.Linear(512*2, 512).cuda('cuda:0').requires_grad_(True)
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
 
-    def all_kl(self, x0, clip_denoised=True):
-        total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(self._denoise, x0, clip_denoised)
+    def all_kl(self, x0, img, clip_denoised=True):
+        total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(self._denoise, x0, img, clip_denoised)
 
         return {
             'total_bpd_b': total_bpd_b,
@@ -419,38 +565,40 @@ class Model(nn.Module):
         }
 
 
-    def _denoise(self, data, t):
+    def _denoise(self, data, t, img, return_latent=False):
         B, D,N= data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
-
-        out = self.model(data, t)
-
+        img = self.image_encoder(img)
+        out, latent = self.model(data, t, img.view(B,-1,*img.shape[2:]))
         assert out.shape == torch.Size([B, D, N])
-        return out
+        if return_latent:
+        	return out, latent, img
+        else:
+        	return out
 
-    def get_loss_iter(self, data, noises=None):
+    def get_loss_iter(self, data, img, noises=None):
         B, D, N = data.shape
-        t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
-
+        t = Variable(torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device))
         if noises is not None:
             noises[t!=0] = torch.randn((t!=0).sum(), *noises.shape[1:]).to(noises)
+            
+        losses, directional_loss = self.diffusion.p_losses(
+            denoise_fn=self._denoise, data_start=data, t=t, noise=noises, img=img)
 
-        losses = self.diffusion.p_losses(
-            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
-        assert losses.shape == t.shape == torch.Size([B])
-        return losses
+        return losses.mean(), directional_loss.mean()
 
-    def gen_samples(self, shape, device, noise_fn=torch.randn,
+    def gen_samples(self, shape, device, img, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
+        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn, img=img,
                                             clip_denoised=clip_denoised,
                                             keep_running=keep_running)
 
-    def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
+    def gen_sample_traj(self, shape, device, freq, img, noise_fn=torch.randn,
                     clip_denoised=True,keep_running=False):
-        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
+        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, 
+                                                       freq=freq, img=img,
                                                        clip_denoised=clip_denoised,
                                                        keep_running=keep_running)
 
@@ -459,10 +607,8 @@ class Model(nn.Module):
 
     def eval(self):
         self.model.eval()
-
     def multi_gpu_wrapper(self, f):
         self.model = f(self.model)
-
 
 def get_betas(schedule_type, b_start, b_end, time_num):
     if schedule_type == 'linear':
@@ -511,23 +657,8 @@ def get_dataset(dataroot, npoints,category):
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
 
-    if opt.distribution_type == 'multi':
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            num_replicas=opt.world_size,
-            rank=opt.rank
-        )
-        if test_dataset is not None:
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                test_dataset,
-                num_replicas=opt.world_size,
-                rank=opt.rank
-            )
-        else:
-            test_sampler = None
-    else:
-        train_sampler = None
-        test_sampler = None
+    train_sampler = None
+    test_sampler = None
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=train_sampler,
                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
@@ -540,82 +671,55 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
 
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
+class Autoencoder(nn.Module):
+     def __init__(self, opt):
+        super().__init__()
+        config = OmegaConf.load(opt.autoencoder_config)
+        vae_config = config.model
+        self.model = instantiate_from_config(vae_config)
+        # self.model.encoder.conv_in = nn.Conv2d(1, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        # self.model.decoder.conv_out = nn.Conv2d(128, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        vae_weight = torch.load(opt.autoencoder)
+        new_weight = {}
+        # for key, item in vae_weight.items():
+        #     if key.startswith("model."):
+        #         new_weight[key[len("model."):]] = item
+        self.model.load_state_dict(vae_weight)
+
+
+     def forward(self,x): return self.model(x)
+     def encode(self, x): return self.model.encode(x).sample()
 
 def train(gpu, opt, output_dir, noises_init):
 
     set_seed(opt)
     logger = setup_logging(output_dir)
-    if opt.distribution_type == 'multi':
-        should_diag = gpu==0
-    else:
-        should_diag = True
+    should_diag = True
     if should_diag:
         outf_syn, = setup_output_subdirs(output_dir, 'syn')
 
-    if opt.distribution_type == 'multi':
-        if opt.dist_url == "env://" and opt.rank == -1:
-            opt.rank = int(os.environ["RANK"])
-
-        base_rank =  opt.rank * opt.ngpus_per_node
-        opt.rank = base_rank + gpu
-        dist.init_process_group(backend=opt.dist_backend, init_method=opt.dist_url,
-                                world_size=opt.world_size, rank=opt.rank)
-
-        opt.bs = int(opt.bs / opt.ngpus_per_node)
-        opt.workers = 0
-
-        opt.saveIter =  int(opt.saveIter / opt.ngpus_per_node)
-        opt.diagIter = int(opt.diagIter / opt.ngpus_per_node)
-        opt.vizIter = int(opt.vizIter / opt.ngpus_per_node)
-
-
     ''' data '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
+    train_dataset, val_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
+    dataloader, val_dataloader, train_sampler, val_sampler = get_dataloader(opt, train_dataset, val_dataset)
 
 
     '''
     create networks
     '''
-
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
     model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
-    if opt.distribution_type == 'multi':  # Multiple processes, single GPU per process
-        def _transform_(m):
-            return nn.parallel.DistributedDataParallel(
-                m, device_ids=[gpu], output_device=gpu)
-
-        torch.cuda.set_device(gpu)
-        model.cuda(gpu)
-        model.multi_gpu_wrapper(_transform_)
-
-
-    elif opt.distribution_type == 'single':
-        def _transform_(m):
-            return nn.parallel.DataParallel(m)
-        model = model.cuda()
-        model.multi_gpu_wrapper(_transform_)
-
-    elif gpu is not None:
-        torch.cuda.set_device(gpu)
-        model = model.cuda(gpu)
-    else:
-        raise ValueError('distribution_type = multi | single | None')
-
-    if should_diag:
-        logger.info(opt)
-
+    if opt.model != '':
+        ckpt = torch.load(opt.model)
+        #model.build()
+        model.build(ckpt['model_state'])
+    #optimizer= optim.Adam(model.parameters(), lr=ckpt['optimizer_state']['param_groups'][0]['lr'], weight_decay=ckpt['optimizer_state']['param_groups'][0]['weight_decay'], betas=ckpt['optimizer_state']['param_groups'][0]['betas'], capturable=True)
     optimizer= optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.decay, betas=(opt.beta1, 0.999))
-
+    #optimizer.load_state_dict(ckpt['optimizer_state'])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
 
     if opt.model != '':
-        ckpt = torch.load(opt.model)
-        model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
-
-    if opt.model != '':
+        start_epoch = 0
         start_epoch = torch.load(opt.model)['epoch'] + 1
     else:
         start_epoch = 0
@@ -623,31 +727,26 @@ def train(gpu, opt, output_dir, noises_init):
     def new_x_chain(x, num_chain):
         return torch.randn(num_chain, *x.shape[1:], device=x.device)
 
-
-
     for epoch in range(start_epoch, opt.niter):
-
-        if opt.distribution_type == 'multi':
-            train_sampler.set_epoch(epoch)
-
-        lr_scheduler.step(epoch)
-
         for i, data in enumerate(dataloader):
-            x = data['train_points'].transpose(1,2)
-            noises_batch = noises_init[data['idx']].transpose(1,2)
-
+            x = data['train_points'].transpose(1,2).float()
+            img = data['img'].float()
+            img = img.view(-1, *img.shape[-3:])
+            torchvision.utils.save_image(img, "abc.png")
+            noises_batch = noises_init[data['idx']].transpose(1,2).float()
+            
             '''
             train diffusion
             '''
 
-            if opt.distribution_type == 'multi' or (opt.distribution_type is None and gpu is not None):
-                x = x.cuda(gpu)
-                noises_batch = noises_batch.cuda(gpu)
-            elif opt.distribution_type == 'single':
-                x = x.cuda()
-                noises_batch = noises_batch.cuda()
-
-            loss = model.get_loss_iter(x, noises_batch).mean()
+            if opt.distribution_type == 'single' or True:
+                x = x.cuda('cuda:0')
+                img = img.cuda('cuda:0')
+                noises_batch = noises_batch.cuda('cuda:0')
+            
+            p_loss, directional_loss = model.get_loss_iter(x,img, noises_batch)
+            loss = p_loss * (1 - opt.clip_lambda) + opt.clip_lambda * directional_loss
+            
 
             optimizer.zero_grad()
             loss.backward()
@@ -656,14 +755,14 @@ def train(gpu, opt, output_dir, noises_init):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
 
             optimizer.step()
-
+            lr_scheduler.step()
 
             if i % opt.print_freq == 0 and should_diag:
 
-                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
-                             'netpNorm: {:>10.2f},   netgradNorm: {:>10.2f}     '
+                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f}, p_loss: {:>10.4f}, dir_loss: {:>10.4f},    '
+                             'netpNorm: {:>10.2f},   netgradNorm: {:>10.4f}     '
                              .format(
-                        epoch, opt.niter, i, len(dataloader),loss.item(),
+                        epoch, opt.niter, i, len(dataloader),loss.item(), p_loss.item(), directional_loss.item(),
                     netpNorm, netgradNorm,
                         ))
 
@@ -673,7 +772,7 @@ def train(gpu, opt, output_dir, noises_init):
             logger.info('Diagnosis:')
 
             x_range = [x.min().item(), x.max().item()]
-            kl_stats = model.all_kl(x)
+            kl_stats = model.all_kl(x.cuda('cuda:0'), img.cuda('cuda:0'))
             logger.info('      [{:>3d}/{:>3d}]    '
                          'x_range: [{:>10.4f}, {:>10.4f}],   '
                          'total_bpd_b: {:>10.4f},    '
@@ -694,14 +793,19 @@ def train(gpu, opt, output_dir, noises_init):
 
             model.eval()
             with torch.no_grad():
-
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=40, clip_denoised=False)
+                x = data['test_points'].transpose(1,2).float().cuda('cuda:0')
+                #img = data['img'].float().cuda('cuda:0')
+                #img = img.view(-1, *img.shape[-3:])
+                #noises_batch = noises_init[data['idx']].transpose(1,2).float().cuda('cuda:0')
+                # x_gen_eval = model.gen_samples(x.shape, x.device, img=img, clip_denoised=False)
+                # x_gen_list = model.gen_sample_traj(x[-1:].shape, x.device, img=img[-6:], freq=40, clip_denoised=False)
+                x_gen_eval = model.gen_samples(new_x_chain(x, 16).shape, x.device, img=img, clip_denoised=False)
+                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, img=img[:6], freq=40, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
-
+                
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
                 gen_eval_range = [x_gen_eval.min().item(), x_gen_eval.max().item()]
-
+                
                 logger.info('      [{:>3d}/{:>3d}]  '
                              'eval_gen_range: [{:>10.4f}, {:>10.4f}]     '
                              'eval_gen_stats: [mean={:>10.4f}, std={:>10.4f}]      '
@@ -726,13 +830,6 @@ def train(gpu, opt, output_dir, noises_init):
             logger.info('Generation: train')
             model.train()
 
-
-
-
-
-
-
-
         if (epoch + 1) % opt.saveIter == 0:
 
             if should_diag:
@@ -746,14 +843,6 @@ def train(gpu, opt, output_dir, noises_init):
 
                 torch.save(save_dict, '%s/epoch_%d.pth' % (output_dir, epoch))
 
-
-            if opt.distribution_type == 'multi':
-                dist.barrier()
-                map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
-                model.load_state_dict(
-                    torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
-
-    dist.destroy_process_group()
 
 def main():
     opt = parse_args()
@@ -774,12 +863,7 @@ def main():
     if opt.dist_url == "env://" and opt.world_size == -1:
         opt.world_size = int(os.environ["WORLD_SIZE"])
 
-    if opt.distribution_type == 'multi':
-        opt.ngpus_per_node = torch.cuda.device_count()
-        opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init))
-    else:
-        train(opt.gpu, opt, output_dir, noises_init)
+    train(opt.gpu, opt, output_dir, noises_init)
 
 
 
@@ -787,7 +871,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
-    parser.add_argument('--category', default='chair')
+    parser.add_argument('--category', default='airplane')
 
     parser.add_argument('--bs', type=int, default=16, help='input batch size')
     parser.add_argument('--workers', type=int, default=16, help='workers')
@@ -796,7 +880,7 @@ def parse_args():
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)
     '''model'''
-    parser.add_argument('--beta_start', default=0.0001)
+    parser.add_argument('--beta_start', default=0.0001, type=float)
     parser.add_argument('--beta_end', default=0.02)
     parser.add_argument('--schedule_type', default='linear')
     parser.add_argument('--time_num', default=1000)
@@ -808,15 +892,19 @@ def parse_args():
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
+    parser.add_argument('--render_finetune', default=True)
 
     parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
+    parser.add_argument('--clip_lambda', type=float, default=0.00001, help='lambda for render loss')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
     parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
     parser.add_argument('--lr_gamma', type=float, default=0.998, help='lr decay for EBM')
 
-    parser.add_argument('--model', default='', help="path to model (to continue training)")
-
+    parser.add_argument('--model', default='/localdata/cychandp/PVD/airplane_2899.pth', help="path to model (to continue training)")
+    # autoencoder_model_path
+    parser.add_argument('--autoencoder_config', default='/cluster/51/go25dap/FinetuneVAE-SD/models/first_stage_models/kl-f16/config.yaml', help="path to autoencoder config")
+    parser.add_argument('--autoencoder', default='/localdata/cychandp/epoch.pth', help="path to autoencoder model")
 
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
@@ -836,7 +924,7 @@ def parse_args():
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=100, help='unit: epoch')
+    parser.add_argument('--saveIter', type=int, default=50, help='unit: epoch')
     parser.add_argument('--diagIter', default=50, help='unit: epoch')
     parser.add_argument('--vizIter', default=50, help='unit: epoch')
     parser.add_argument('--print_freq', default=50, help='unit: iter')
