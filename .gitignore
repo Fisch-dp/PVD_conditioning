@@ -1,1 +1,14 @@
+<<<<<<< HEAD
 output/
+=======
+.idea
+data
+output
+__pycache__
+*.png
+*.net
+*.npy
+*.npz
+eval_model
+eval_data
+>>>>>>> 9747265a5f141e5546fd4f862bfa66aa59f1bd33

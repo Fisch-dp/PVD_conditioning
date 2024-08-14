@@ -7,6 +7,7 @@ from modules import SharedMLP, PVConv, PointNetSAModule, PointNetAModule, PointN
 from model.text_encoder import TextEmbedding
 from modules.se import SE3d
 
+
 def _linear_gn_relu(in_channels, out_channels):
     return nn.Sequential(nn.Linear(in_channels, out_channels), nn.GroupNorm(8,out_channels), Swish())
 
@@ -282,6 +283,5 @@ class PVCNN2Base(nn.Module):
             features = self.global_att(features)
         for fp_idx, fp_blocks  in enumerate(self.fp_layers):
             features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
-            
 
         return self.classifier(features)

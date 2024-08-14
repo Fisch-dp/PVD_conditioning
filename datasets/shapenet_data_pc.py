@@ -54,7 +54,6 @@ class Uniform15KPC(Dataset):
         self.input_dim = input_dim
         self.use_mask = use_mask
         self.box_per_shape = box_per_shape
-        ###evtim
         self.descriptions_df = descriptions_df
         ###
         if use_mask:
@@ -178,7 +177,6 @@ class Uniform15KPC(Dataset):
         sid, mid = self.all_cate_mids[idx]
 
         #print('synset_id', sid,'mid', mid)
-        ###Evtim - Get description
         description_row = self.descriptions_df[(self.descriptions_df['model_id'] == mid.replace(self.split + '/', '')) & (self.descriptions_df['synset_id'] == int(sid[1:]))]
         description = description_row['description'].values[0] if not description_row.empty else "No description available."
        
@@ -189,7 +187,7 @@ class Uniform15KPC(Dataset):
             'test_points': te_out,
             'mean': m, 'std': s, 'cate_idx': cate_idx,
             'sid': sid, 'mid': mid,
-            'description': description ###Evtim
+            'description': description 
         }
 
         if self.use_mask:
@@ -211,9 +209,7 @@ class Uniform15KPC(Dataset):
 
 class ShapeNet15kPointClouds(Uniform15KPC):
     def __init__(self, root_dir="data/ShapeNetCore.v2.PC15k",
-                 ###evtim
                  descriptions_file="data/shapenet_c13_description.csv",
-                 ###
                  categories=['airplane'], tr_sample_size=10000, te_sample_size=2048,
                  split='train', scale=1., normalize_per_shape=False,
                  normalize_std_per_axis=False, box_per_shape=False,
@@ -225,9 +221,7 @@ class ShapeNet15kPointClouds(Uniform15KPC):
         assert self.split in ['train', 'test', 'val', 'overfit']
         self.tr_sample_size = tr_sample_size
         self.te_sample_size = te_sample_size
-        ######evtim
         self.descriptions = pd.read_csv(descriptions_file)
-        ######
         self.cates = categories
         if 'all' in categories:
             self.synset_ids = list(cate_to_synsetid.values())
@@ -250,7 +244,6 @@ class ShapeNet15kPointClouds(Uniform15KPC):
             input_dim=3, use_mask=use_mask)
 
 
-        
 
 class PointCloudMasks(object):
     '''
