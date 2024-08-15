@@ -1,13 +1,9 @@
-# Shape Generation and Completion Through Point-Voxel Diffusion
+# RGB-Conditioned Point-Voxel Diffusion
 <p align="center">
   <img src="assets/pvd_teaser.gif" width="80%"/>
 </p>
 
-[Project](https://alexzhou907.github.io/pvd) | [Paper](https://arxiv.org/abs/2104.03670) 
-
-Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
-
-[Linqi Zhou](https://alexzhou907.github.io), [Yilun Du](https://yilundu.github.io/), [Jiajun Wu](https://jiajunwu.com/)
+Implementation of RGB-Conditioning Part of Text and Image Conditional Point-Voxel Diffusion
 
 ## Requirements:
 
@@ -32,21 +28,12 @@ python setup.py install
 cp build/**/emd_cuda.cpython-36m-x86_64-linux-gnu.so .
 ```
 
-The code was tested on Unbuntu with Titan RTX. 
+The code was tested on RTX 3090
 
 ## Data
 
 For generation, we use ShapeNet point cloud, which can be downloaded [here](https://github.com/stevenygd/PointFlow).
-
-For completion, we use ShapeNet rendering provided by [GenRe](https://github.com/xiumingzhang/GenRe-ShapeHD).
-We provide script `convert_cam_params.py` to process the provided data.
-
-For training the model on shape completion, we need camera parameters for each view
-which are not directly available. To obtain these, simply run 
-```bash
-$ python convert_cam_params.py --dataroot DATA_DIR --mitsuba_xml_root XML_DIR
-```
-which will create `..._cam_params.npz` in each provided data folder for each view.
+RGB Image for conditioning can be obtained from [here](https://huggingface.co/datasets/ShapeNet/ShapeNetCore) under /screenshots.
 
 ## Pretrained models
 Pretrained models can be downloaded [here](https://drive.google.com/drive/folders/1Q7aSaTr6lqmo8qx80nIm1j28mOHAHGiM?usp=sharing).
@@ -54,15 +41,20 @@ Pretrained models can be downloaded [here](https://drive.google.com/drive/folder
 ## Training:
 
 ```bash
-$ python train_generation.py --category car|chair|airplane
+$ python train_generation.py --category car|chair|airplane --concatenation direct_sum | attention
 ```
 
 Please refer to the python file for optimal training parameters.
 
 ## Testing:
 
+Testing original PVD model
 ```bash
-$ python train_generation.py --category car|chair|airplane --model MODEL_PATH
+$ python train_generation.py --category car|chair|airplane --model MODEL_PATH --origianl_pvd_model True 
+```
+Testing our model
+```bash
+$ python train_generation.py --category car|chair|airplane --model MODEL_PATH --concatenation direct_sum | attention
 ```
 
 ## Results
