@@ -493,7 +493,7 @@ class Model(nn.Module):
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
         
         self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention, use_ca=False,
-                            dropout=args.dropout, extra_feature_channels=0)
+                            dropout=args.dropout, extra_feature_channels=0, concat=args.concatenation)
         self.args = args
 
     def build(self,state_dict=""): 
@@ -543,13 +543,15 @@ class Model(nn.Module):
         for i,(dim_in, dim_out, ca_dim) in enumerate(zip([64,128,256,512],[128,256,256,512], [1024,256,64,16])):
             self.model.zero_convs_f.append(zero_module(nn.Conv1d(dim_in, dim_out, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
             self.model.zero_convs_c.append(zero_module(nn.Conv1d(3, 3, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
-            self.model.ca_f.append(Attention(dim_out*2, 8, 1).cuda('cuda:0').requires_grad_(True))
-            self.model.ca_c.append(Attention(3*2, 1, 1).cuda('cuda:0').requires_grad_(True))
+            if self.args.concatenation == "attention":
+                self.model.ca_f.append(Attention(dim_out*2, 8, 1).cuda('cuda:0').requires_grad_(True))
+                self.model.ca_c.append(Attention(3*2, 1, 1).cuda('cuda:0').requires_grad_(True))
             #self.model.mlp_f.append(nn.Linear(dim_out*2, dim_out).cuda('cuda:0').requires_grad_(True))
             #self.model.mlp_c.append(nn.Linear(3*2,3).cuda('cuda:0').requires_grad_(True))
         self.model.global_att_d = global_att_d
         self.model.global_zero = zero_module(nn.Conv1d(512, 512, 3, padding=1)).cuda('cuda:0').requires_grad_(True)
-        self.model.global_ca = Attention(512*2, 8, 1).cuda('cuda:0').requires_grad_(True)
+        if self.args.concatenation == "attention":
+            self.model.global_ca = Attention(512*2, 8, 1).cuda('cuda:0').requires_grad_(True)
         #self.model.global_mlp = nn.Linear(512*2, 512).cuda('cuda:0').requires_grad_(True)
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -884,7 +886,7 @@ def parse_args():
     parser.add_argument('--beta_end', default=0.02)
     parser.add_argument('--schedule_type', default='linear')
     parser.add_argument('--time_num', default=1000)
-
+    parser.add_argument('--concatenation', default="attention")
     #params
     parser.add_argument('--attention', default=True)
     parser.add_argument('--dropout', default=0.1)

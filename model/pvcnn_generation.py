@@ -184,11 +184,12 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
 class PVCNN2Base(nn.Module):
 
     def __init__(self, num_classes, embed_dim, use_att, use_ca, dropout=0.1,
-                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1):
+                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1, concat="attention"):
         super().__init__()
         assert extra_feature_channels >= 0
         self.embed_dim = embed_dim
         self.in_channels = extra_feature_channels + 3
+        self.concat = concat
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
             sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
@@ -263,15 +264,21 @@ class PVCNN2Base(nn.Module):
         if self.global_att is not None:
             features_d = self.global_att_d(features_d)
             features_d = self.global_zero(features_d)
-            features_d = self.global_ca(torch.cat([features, features_d], dim=1))
-            #features_d = self.global_mlp(features_d.transpose(2,1)).transpose(2,1)
-            features_d = features_d[:,features.shape[1]:,:]
+            if self.concat == "attention":
+                features_d = self.global_ca(torch.cat([features, features_d], dim=1))
+                #features_d = self.global_mlp(features_d.transpose(2,1)).transpose(2,1)
+                features_d = features_d[:,features.shape[1]:,:]
             features = self.global_att(features + features_d)
             latent = features
 
         for fp_idx, fp_blocks in enumerate(self.fp_layers):
-            features = features + self.ca_f[-1-fp_idx](torch.cat([features, in_features_list_d[-1-fp_idx]], dim=1))[:features.shape[1],:,:]
-            coords = coords + self.ca_c[-1-fp_idx](torch.cat([coords, coords_list_d[-1-fp_idx]], dim=1))[:,coords.shape[1]:,:]
+            features_d = in_features_list_d[-1-fp_idx]
+            coords_d = coords_list_d[-1-fp_idx]
+            if self.concat == "attention":
+                features_d = self.ca_f[-1-fp_idx](torch.cat([features, features_d], dim=1))[:features.shape[1],:,:]
+                features = features + features_d
+                coords_d = self.ca_c[-1-fp_idx](torch.cat([coords, coords_d], dim=1))[:,coords.shape[1]:,:]
+                coords = coords + coords_d
             features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
                 
         return self.classifier(features), latent
