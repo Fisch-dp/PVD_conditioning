@@ -496,13 +496,14 @@ class Model(nn.Module):
                             dropout=args.dropout, extra_feature_channels=0, concat=args.concatenation)
         self.args = args
 
-    def build(self,state_dict=""): 
-        if not state_dict == "":
+    def build(self,state_dict="", pvd_model=True): 
+
+        if not state_dict == "" and pvd_model:
             new_dict = {}
             for key, value in state_dict.items():
             	key = key[len("model.module"):]
-            	key = "model" + key
-            	new_dict[key] = value
+                key = "model" + key
+                new_dict[key] = value
             self.load_state_dict(new_dict)
         self.model.cuda('cuda:0')
         sa_layers_d = deepcopy(self.model.sa_layers).cuda('cuda:0').requires_grad_(True)
@@ -538,21 +539,23 @@ class Model(nn.Module):
         self.model.zero_convs_c = []
         self.model.ca_f = []
         self.model.ca_c = []
-        self.model.mlp_f = []
-        self.model.mlp_c = []
         for i,(dim_in, dim_out, ca_dim) in enumerate(zip([64,128,256,512],[128,256,256,512], [1024,256,64,16])):
-            self.model.zero_convs_f.append(zero_module(nn.Conv1d(dim_in, dim_out, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
-            self.model.zero_convs_c.append(zero_module(nn.Conv1d(3, 3, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+            if self.args.concatenation == "direct_sum":
+                self.model.zero_convs_f.append(zero_module(nn.Conv1d(dim_in, dim_out, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+                self.model.zero_convs_c.append(zero_module(nn.Conv1d(3, 3, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
             if self.args.concatenation == "attention":
-                self.model.ca_f.append(Attention(dim_out*2, 8, 1).cuda('cuda:0').requires_grad_(True))
+                self.model.zero_convs_f.append(zero_module(nn.Conv1d(dim_in+dim_out, dim_out, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+                self.model.zero_convs_c.append(zero_module(nn.Conv1d(3*2, 3, 3, padding=1)).cuda('cuda:0').requires_grad_(True))
+                self.model.ca_f.append(Attention(dim_in+dim_out, 8, 1).cuda('cuda:0').requires_grad_(True))
                 self.model.ca_c.append(Attention(3*2, 1, 1).cuda('cuda:0').requires_grad_(True))
-            #self.model.mlp_f.append(nn.Linear(dim_out*2, dim_out).cuda('cuda:0').requires_grad_(True))
-            #self.model.mlp_c.append(nn.Linear(3*2,3).cuda('cuda:0').requires_grad_(True))
         self.model.global_att_d = global_att_d
-        self.model.global_zero = zero_module(nn.Conv1d(512, 512, 3, padding=1)).cuda('cuda:0').requires_grad_(True)
-        if self.args.concatenation == "attention":
+        if self.args.concatenation == "direct_sum":
+            self.model.global_zero = zero_module(nn.Conv1d(512, 512, 3, padding=1)).cuda('cuda:0').requires_grad_(True)
+        elif self.args.concatenation == "attention":
+            self.model.global_zero = zero_module(nn.Conv1d(512*2, 512, 3, padding=1)).cuda('cuda:0').requires_grad_(True)
             self.model.global_ca = Attention(512*2, 8, 1).cuda('cuda:0').requires_grad_(True)
-        #self.model.global_mlp = nn.Linear(512*2, 512).cuda('cuda:0').requires_grad_(True)
+        if not state_dict == "" and not pvd_model:
+            self.load_state_dict(state_dict)
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
 
@@ -733,8 +736,6 @@ def train(gpu, opt, output_dir, noises_init):
         for i, data in enumerate(dataloader):
             x = data['train_points'].transpose(1,2).float()
             img = data['img'].float()
-            img = img.view(-1, *img.shape[-3:])
-            torchvision.utils.save_image(img, "abc.png")
             noises_batch = noises_init[data['idx']].transpose(1,2).float()
             
             '''
@@ -796,12 +797,10 @@ def train(gpu, opt, output_dir, noises_init):
             model.eval()
             with torch.no_grad():
                 x = data['test_points'].transpose(1,2).float().cuda('cuda:0')
-                #img = data['img'].float().cuda('cuda:0')
-                #img = img.view(-1, *img.shape[-3:])
-                #noises_batch = noises_init[data['idx']].transpose(1,2).float().cuda('cuda:0')
-                # x_gen_eval = model.gen_samples(x.shape, x.device, img=img, clip_denoised=False)
-                # x_gen_list = model.gen_sample_traj(x[-1:].shape, x.device, img=img[-6:], freq=40, clip_denoised=False)
-                x_gen_eval = model.gen_samples(new_x_chain(x, 16).shape, x.device, img=img, clip_denoised=False)
+                img = data['img'].float().cuda('cuda:0')
+                img = img.view(-1, *img.shape[-3:])
+                noises_batch = noises_init[data['idx']].transpose(1,2).float().cuda('cuda:0')
+                x_gen_eval = model.gen_samples(new_x_chain(x, opt.bs).shape, x.device, img=img, clip_denoised=False)
                 x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, img=img[:6], freq=40, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
                 
@@ -886,7 +885,6 @@ def parse_args():
     parser.add_argument('--beta_end', default=0.02)
     parser.add_argument('--schedule_type', default='linear')
     parser.add_argument('--time_num', default=1000)
-    parser.add_argument('--concatenation', default="attention")
     #params
     parser.add_argument('--attention', default=True)
     parser.add_argument('--dropout', default=0.1)
@@ -897,16 +895,17 @@ def parse_args():
     parser.add_argument('--render_finetune', default=True)
 
     parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
-    parser.add_argument('--clip_lambda', type=float, default=0.00001, help='lambda for render loss')
+    parser.add_argument('--clip_lambda', type=float, default=0, help='lambda for clip loss')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
     parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
     parser.add_argument('--lr_gamma', type=float, default=0.998, help='lr decay for EBM')
 
-    parser.add_argument('--model', default='/localdata/cychandp/PVD/airplane_2899.pth', help="path to model (to continue training)")
+    parser.add_argument('--model', default='airplane_2899.pth', help="path to model (to continue training)")
+    parser.add_argument('--concatenation', default="attention")
     # autoencoder_model_path
-    parser.add_argument('--autoencoder_config', default='/cluster/51/go25dap/FinetuneVAE-SD/models/first_stage_models/kl-f16/config.yaml', help="path to autoencoder config")
-    parser.add_argument('--autoencoder', default='/localdata/cychandp/epoch.pth', help="path to autoencoder model")
+    parser.add_argument('--autoencoder_config', default='', help="path to autoencoder config")
+    parser.add_argument('--autoencoder', default='', help="path to autoencoder model")
 
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,

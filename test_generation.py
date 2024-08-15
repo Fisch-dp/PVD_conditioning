@@ -263,7 +263,6 @@ def main(opt):
         return nn.parallel.DataParallel(m)
         
     model = model.cuda()
-    model.multi_gpu_wrapper(_transform_)
 
     model.eval()
 
@@ -272,7 +271,7 @@ def main(opt):
         logger.info("Resume Path:%s" % opt.model)
 
         resumed_param = torch.load(opt.model)
-        model.build(resumed_param['model_state'])
+        model.build(resumed_param['model_state'], pvd_model=opt.origianl_pvd_model)
 
 
         ref = None
@@ -316,10 +315,11 @@ def parse_args():
     parser.add_argument('--model_var_type', default='fixedsmall')
 
 
-    parser.add_argument('--model', default='/cluster/51/go25dap/PVD/output/train_generation/2024-08-03-12-28-28/epoch_3999.pth', help="path to model (to continue training)")
-    #'/cluster/51/go25dap/PVD/output/train_generation/2024-07-21-20-24-37/epoch_74.pth'
-    parser.add_argument('--autoencoder', default='/cluster/51/go25dap/FinetuneVAE-SD/epoch=19-step=31779.ckpt', help="path to autoencoder model")
-    parser.add_argument('--autoencoder_config', default="/cluster/51/go25dap/FinetuneVAE-SD/models/first_stage_models/kl-f16/config.yaml")
+    parser.add_argument('--model', help="path to model for evaluation")
+    parser.add_argument('--concatenation', default="attention")
+    parser.add_argument('--origianl_pvd_model', default=False)
+    parser.add_argument('--autoencoder', default='', help="path to autoencoder model")
+    parser.add_argument('--autoencoder_config', default="")
 
     '''eval'''
 
