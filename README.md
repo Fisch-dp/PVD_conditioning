@@ -1,7 +1,4 @@
 # RGB-Conditioned Point-Voxel Diffusion
-<p align="center">
-  <img src="assets/pvd_teaser.gif" width="80%"/>
-</p>
 
 Implementation of RGB-Conditioning Part of Text and Image Conditional Point-Voxel Diffusion
 
@@ -56,44 +53,3 @@ Testing our model
 ```bash
 $ python train_generation.py --category car|chair|airplane --model MODEL_PATH --concatenation direct_sum | attention
 ```
-
-## Results
-
-Some generation and completion results are as follows.
-<p align="center">
-  <img src="assets/gen_comp.gif" width="60%"/>
-</p>
-
-Multimodal completion on a ShapeNet chair.
-<p align="center">
-  <img src="assets/mm_shapenet.gif" width="80%"/>
-</p>
-
-
-Multimodal completion on PartNet.
-<p align="center">
-  <img src="assets/mm_partnet.gif" width="80%"/>
-</p>
-
-
-Multimodal completion on two Redwood 3DScan chairs.
-<p align="center">
-  <img src="assets/mm_redwood.gif" width="80%"/>
-</p>
-
-## Reference
-
-```
-@inproceedings{Zhou_2021_ICCV,
-    author    = {Zhou, Linqi and Du, Yilun and Wu, Jiajun},
-    title     = {3D Shape Generation and Completion Through Point-Voxel Diffusion},
-    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-    month     = {October},
-    year      = {2021},
-    pages     = {5826-5835}
-}
-```
-
-## Acknowledgement
-
-For any questions related to codes and experiment setting, please contact [Linqi Zhou](linqizhou@stanford.edu) and [Yilun Du](yilundu@mit.edu). 
