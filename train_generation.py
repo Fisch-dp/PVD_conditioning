@@ -527,7 +527,7 @@ class Model(nn.Module):
             nn.SiLU(),
             nn.Conv2d(128,256,3,padding=1, stride=2),
             nn.SiLU(),
-            zero_module(nn.Conv2d(256, 16, 3, padding=1))
+            nn.Conv2d(256, 16, 3, padding=1)
         ).cuda('cuda:0').requires_grad_(True)
         for p in self.model.parameters():
                 p.requires_grad_(False)
